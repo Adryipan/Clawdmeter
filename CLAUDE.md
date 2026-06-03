@@ -118,6 +118,32 @@ Each animation has a per-animation 10-color RGB565 palette. Cell values 0..9 ind
 
 See `~/.claude/projects/.../memory/` files for persistent context (user is an embedded-beginner senior dev, brand-conscious, prefers iterative UI refinement, dislikes me authoring my own art when third-party assets are intended). Always read those memory files at session start.
 
+## Fork-only workflow (do not PR upstream)
+
+This checkout is wired to **two remotes**:
+
+- `origin` → `git@github.com:Adryipan/Clawdmeter.git` (user's fork — push here)
+- `upstream` → `git@github.com:HermannBjorgvin/Clawdmeter.git` (Hermann's repo — pull only)
+
+**Policy: all changes stay on the fork.** Do not open PRs to `HermannBjorgvin/Clawdmeter` without an explicit "open the PR upstream" instruction in the current session. Default action after a fix is: commit → push to `origin` → reflash. Stop there.
+
+**Active long-lived branch:** `fix/battery-display-and-ble-service` — carries the local battery fixes (real `power_hal_battery_pct()` instead of hardcoded `100` in `ble.cpp`, plus explicit `setChargerConstantCurr` / `setVbusCurrentLimit` / `setThermaThreshold` in the 2.16 board's `power.cpp`). Rebased on top of `upstream/main`. Reflash from this branch, not from `main`.
+
+**Sync workflow (when upstream moves):**
+
+```bash
+cd ~/repo/Clawdmeter
+git fetch upstream
+git checkout fix/battery-display-and-ble-service
+git rebase upstream/main
+git push --force-with-lease origin fix/battery-display-and-ble-service
+./flash-mac.sh waveshare_amoled_216
+```
+
+If a rebase makes a local fix redundant (upstream landed an equivalent fix), the rebase will drop the commit cleanly — verify by checking the device-name and `setBatteryLevel` call site in `firmware/src/ble.cpp` before reflashing.
+
+The installed daemon (`~/Library/LaunchAgents/com.user.claude-usage-daemon.plist`) points at `~/repo/Clawdmeter/daemon/`, so the checkout path is load-bearing for the running daemon — don't move or rename the working tree.
+
 ## Recent session highlights
 
 - **Device-abstraction refactor (2026-05-18).** All board-conditional code moved out of shared files into `boards/<name>/` and behind a HAL in `hal/`. ~30 `#ifdef BOARD_*` blocks went to zero. UI is responsive via `compute_layout()` driven by `board_caps()`. New ports add a folder + a PlatformIO env — no shared file edits.
