@@ -34,6 +34,9 @@ void power_hal_init(void) {
 
     pmu.enableBattDetection();
     pmu.enableBattVoltageMeasure();
+    pmu.setChargerConstantCurr(XPOWERS_AXP2101_CHG_CUR_500MA);
+    pmu.setThermaThreshold(XPOWERS_AXP2101_THREMAL_80DEG);
+    pmu.setVbusCurrentLimit(XPOWERS_AXP2101_VBUS_CUR_LIM_900MA);
 
     pmu.disableIRQ(XPOWERS_AXP2101_ALL_IRQ);
     pmu.clearIrqStatus();
