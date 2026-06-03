@@ -2,6 +2,7 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <NimBLEHIDDevice.h>
+#include "hal/power_hal.h"
 
 #define DEVICE_NAME "Clawdmeter"
 
@@ -63,6 +64,7 @@ static NimBLECharacteristic* req_char = nullptr;
 
 static ble_state_t state = BLE_STATE_INIT;
 static bool need_advertise = false;
+static uint32_t last_batt_update_ms = 0;
 static char rx_buf[BLE_BUF_SIZE];
 static volatile bool data_ready = false;
 static volatile bool has_received_data = false;
@@ -176,7 +178,9 @@ void ble_init(void) {
     // to identify the layout — we only ever send Space / Shift+Tab so the
     // physical layout is irrelevant; advertise a known one to skip the wizard.
     hid_dev->setHidInfo(33, 0x02);
-    hid_dev->setBatteryLevel(100);
+    int init_pct = power_hal_battery_pct();
+    if (init_pct < 0) init_pct = 0;
+    hid_dev->setBatteryLevel((uint8_t)init_pct);
     input_kbd = hid_dev->getInputReport(1);  // report ID 1
 
     // --- Custom data service ---
@@ -212,6 +216,13 @@ void ble_tick(void) {
     if (need_advertise) {
         need_advertise = false;
         start_advertising();
+    }
+    uint32_t now = millis();
+    if (now - last_batt_update_ms >= 10000) {
+        last_batt_update_ms = now;
+        int pct = power_hal_battery_pct();
+        if (pct < 0) pct = 0;
+        hid_dev->setBatteryLevel((uint8_t)pct);
     }
 }
 
