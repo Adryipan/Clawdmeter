@@ -24,3 +24,10 @@ void ble_request_refresh(void);
 // BLE HID keyboard
 void ble_keyboard_press(uint8_t key, uint8_t modifier);
 void ble_keyboard_release(void);
+
+// BLE focus characteristic (UUID ...0005, READ+NOTIFY, unencrypted)
+#define FOCUS_CHAR_UUID "4c41555a-4465-7669-6365-000000000005"
+
+void ble_notify_focus(const char* session_id);  // session_id NULL → {"focus":null}
+void ble_notify_btn(void);                       // {"btn":1}
+bool ble_focus_has_subscriber(void);             // true if ≥1 CCCD enabled

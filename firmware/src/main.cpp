@@ -112,6 +112,29 @@ static bool parse_json(const char* json, UsageData* out) {
     strlcpy(out->status, doc["st"] | "unknown", sizeof(out->status));
     out->ok = doc["ok"] | false;
     out->valid = true;
+
+    // Multi-session array
+    out->session_count = 0;
+    out->focused_idx = -1;
+    memset(out->sessions, 0, sizeof(out->sessions));
+    JsonArray ss = doc["ss"];
+    if (!ss.isNull()) {
+        uint8_t idx = 0;
+        for (JsonObject s : ss) {
+            if (idx >= MAX_SESSIONS) break;
+            SessionInfo& si = out->sessions[idx];
+            strlcpy(si.id,     s["i"] | "",  sizeof(si.id));
+            strlcpy(si.name,   s["n"] | "",  sizeof(si.name));
+            strlcpy(si.detail, s["d"] | "",  sizeof(si.detail));
+            const char* m = s["m"].as<const char*>();
+            if (!m || !*m) m = "w";
+            si.mood = (m[0] == 'a' || m[0] == 's' || m[0] == 'd') ? m[0] : MOOD_WORKING;
+            si.focused = (s["f"] | 0) != 0;
+            if (si.focused) out->focused_idx = (int8_t)idx;
+            idx++;
+        }
+        out->session_count = idx;
+    }
     return true;
 }
 
@@ -179,6 +202,7 @@ extern "C" void board_init(void);
 
 void setup() {
     Serial.begin(115200);
+    Serial.setTxTimeoutMs(100);  // guard: prevent disconnected host from blocking loop()
     delay(300);
     Serial.println("{\"ready\":true}");
 
@@ -296,14 +320,20 @@ void loop() {
     // idle_consume_wake_press(); the normal action fires from the second
     // press. Activity bookkeeping happens inside idle_consume_wake_press
     // so no separate idle_note_activity() call is needed here.
+    // ---- PRIMARY (GPIO0 — Space, PTT) — NEVER deferred ----
     {
         static bool primary_was = false;
         static bool primary_wake_swallowed = false;
         bool primary_now = input_hal_is_held(INPUT_BTN_PRIMARY);
         if (primary_now != primary_was) {
             if (primary_now) {
-                if (idle_consume_wake_press()) primary_wake_swallowed = true;
-                else                            ble_keyboard_press(0x2C, 0);  // HID Space, no mods
+                if (idle_consume_wake_press()) {
+                    primary_wake_swallowed = true;
+                } else {
+                    ble_keyboard_press(0x2C, 0);  // HID Space, no mods
+                    // btn-notify only when focus context is live
+                    if (ui_has_focused_session() && ble_focus_has_subscriber()) ble_notify_btn();
+                }
             } else {
                 if (primary_wake_swallowed) primary_wake_swallowed = false;
                 else                        ble_keyboard_release();
@@ -311,17 +341,56 @@ void loop() {
             primary_was = primary_now;
         }
 
+        // ---- SECONDARY (GPIO18 — Shift+Tab, synthetic tap) ----
+        // Always checked every loop iteration — not gated on primary edge detection above.
         if (board_caps().button_count >= 2) {
             static bool secondary_was = false;
             static bool secondary_wake_swallowed = false;
+            static bool secondary_tap_pending = false;
+            static uint32_t secondary_tap_ms = 0;
+            // Stuck-key guard: tracks whether the !ready path sent a raw HID press
+            // so release always matches, regardless of ready flipping mid-hold.
+            static bool secondary_raw_held = false;
+
             bool secondary_now = input_hal_is_held(INPUT_BTN_SECONDARY);
+            // Readiness: both a focused session and an active daemon subscriber required
+            bool ready = ui_has_focused_session() && ble_focus_has_subscriber();
+
+            // Fire deferred synthetic tap once the 300 ms window elapses
+            if (secondary_tap_pending && (millis() - secondary_tap_ms >= 300)) {
+                secondary_tap_pending = false;
+                ble_keyboard_press(0x2B, 0x02);  // HID Tab + LEFT_SHIFT
+                delay(10);  // one-shot HID inter-report gap; brief LVGL stall is intentional — do not asyncify
+                ble_keyboard_release();
+            }
+
             if (secondary_now != secondary_was) {
                 if (secondary_now) {
-                    if (idle_consume_wake_press()) secondary_wake_swallowed = true;
-                    else                            ble_keyboard_press(0x2B, 0x02);  // HID Tab + LEFT_SHIFT
+                    if (idle_consume_wake_press()) {
+                        secondary_wake_swallowed = true;
+                    } else if (ready && !secondary_tap_pending) {
+                        // Ready path: notify daemon, arm 300 ms window for synthetic tap.
+                        // BLE-disconnect during the window is safe: ble_keyboard_press guards
+                        // on connection state, and secondary_tap_pending self-clears on fire.
+                        ble_notify_btn();
+                        secondary_tap_pending = true;
+                        secondary_tap_ms = millis();
+                        // secondary_raw_held stays false — no HID key held
+                    } else if (!ready) {
+                        // Not-ready path: direct raw Shift+Tab hold
+                        ble_keyboard_press(0x2B, 0x02);  // HID Tab + LEFT_SHIFT
+                        secondary_raw_held = true;
+                    }
+                    // else: ready but tap_pending (second press in window) — ignore
                 } else {
-                    if (secondary_wake_swallowed) secondary_wake_swallowed = false;
-                    else                          ble_keyboard_release();
+                    if (secondary_wake_swallowed) {
+                        secondary_wake_swallowed = false;
+                    } else if (secondary_raw_held) {
+                        // Release the raw HID key regardless of current ready state
+                        ble_keyboard_release();
+                        secondary_raw_held = false;
+                    }
+                    // else: synthetic-tap path — physical release is ignored for HID
                 }
                 secondary_was = secondary_now;
             }
@@ -368,6 +437,7 @@ void loop() {
                 if (splash_is_active()) splash_pick_for_current_rate();
             }
             ui_update(&usage);
+            ui_update_sessions(&usage);
             ble_send_ack();
         } else {
             ble_send_nack();
