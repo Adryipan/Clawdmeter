@@ -61,6 +61,11 @@ static NimBLECharacteristic* input_kbd = nullptr;
 static NimBLECharacteristic* tx_char = nullptr;
 static NimBLECharacteristic* rx_char = nullptr;
 static NimBLECharacteristic* req_char = nullptr;
+static NimBLECharacteristic* focus_char = nullptr;
+static uint8_t focus_sub_count = 0;
+// Persisted focus payload — new subscribers receive the current focus state,
+// not a stale {"btn":1} from the last button press.
+static char focus_stored_val[32] = "{\"focus\":null}";
 
 static ble_state_t state = BLE_STATE_INIT;
 static bool need_advertise = false;
@@ -117,7 +122,12 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 
     void onDisconnect(NimBLEServer* s, NimBLEConnInfo& info, int reason) override {
         // Only flip the UI state to DISCONNECTED when the last client leaves.
-        if (s->getConnectedCount() == 0) state = BLE_STATE_DISCONNECTED;
+        if (s->getConnectedCount() == 0) {
+            state = BLE_STATE_DISCONNECTED;
+            // Reset focus subscriber count — single-central device; a central
+            // that disconnects without unsubscribing would otherwise leak the count.
+            focus_sub_count = 0;
+        }
         need_advertise = true;
         Serial.printf("BLE: disconnected (reason=%d, remaining=%u)\n",
             reason, (unsigned)s->getConnectedCount());
@@ -144,6 +154,28 @@ class ReqCallbacks : public NimBLECharacteristicCallbacks {
         Serial.printf("BLE: req_char onSubscribe subValue=%u has_data=%d\n", subValue, has_received_data ? 1 : 0);
         if (subValue != 0 && !has_received_data) {
             ble_request_refresh();
+        }
+    }
+};
+
+class FocusCallbacks : public NimBLECharacteristicCallbacks {
+    void onSubscribe(NimBLECharacteristic* chr, NimBLEConnInfo& info, uint16_t subValue) override {
+        if (subValue != 0) {
+            focus_sub_count++;
+            // Restore stored focus value so new subscriber gets current state.
+            // NOTE: focus_stored_val is read here on the NimBLE host task and written
+            // by ble_notify_focus on the main loop task without a mutex. This is
+            // intentional for the single-central use case: subscribe occurs at daemon
+            // connect, well before any focus activity; worst case is one garbled replay
+            // notify on subscribe.
+            if (focus_char) {
+                focus_char->setValue(focus_stored_val);
+                focus_char->notify();
+            }
+            Serial.printf("BLE: focus_char subscriber added (total=%u)\n", focus_sub_count);
+        } else {
+            if (focus_sub_count > 0) focus_sub_count--;
+            Serial.printf("BLE: focus_char subscriber removed (total=%u)\n", focus_sub_count);
         }
     }
 };
@@ -204,6 +236,14 @@ void ble_init(void) {
     );
     static ReqCallbacks reqCb;
     req_char->setCallbacks(&reqCb);
+
+    focus_char = svc->createCharacteristic(
+        FOCUS_CHAR_UUID,
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
+    );
+    focus_char->setValue(focus_stored_val);
+    static FocusCallbacks focusCb;
+    focus_char->setCallbacks(&focusCb);
 
     svc->start();
     server->start();
@@ -296,4 +336,37 @@ void ble_keyboard_release(void) {
     uint8_t report[8] = {0};
     input_kbd->setValue(report, sizeof(report));
     input_kbd->notify();
+}
+
+void ble_notify_focus(const char* session_id) {
+    if (!focus_char) return;
+    // NOTE: focus_stored_val is written here on the main loop task and read by
+    // FocusCallbacks::onSubscribe on the NimBLE host task without a mutex. This
+    // is intentional for the single-central use case: subscribe occurs at daemon
+    // connect, well before focus activity; worst case is one garbled replay notify.
+    if (session_id) {
+        snprintf(focus_stored_val, sizeof(focus_stored_val),
+                 "{\"focus\":\"%s\"}", session_id);
+    } else {
+        strlcpy(focus_stored_val, "{\"focus\":null}", sizeof(focus_stored_val));
+    }
+    focus_char->setValue(focus_stored_val);
+    focus_char->notify();
+    Serial.printf("BLE: focus notify: %s\n", focus_stored_val);
+}
+
+void ble_notify_btn(void) {
+    if (!focus_char) return;
+    // Transient notify — do NOT persist {"btn":1} as the stored value.
+    // Notify with explicit payload but keep focus_stored_val unchanged so
+    // any new subscriber that connects after this press receives the correct focus state.
+    static const char btn_payload[] = "{\"btn\":1}";
+    focus_char->notify(reinterpret_cast<const uint8_t*>(btn_payload), sizeof(btn_payload) - 1);
+    // Restore stored focus value as the characteristic's readable value.
+    focus_char->setValue(focus_stored_val);
+    Serial.println("BLE: btn notify");
+}
+
+bool ble_focus_has_subscriber(void) {
+    return focus_sub_count > 0;
 }

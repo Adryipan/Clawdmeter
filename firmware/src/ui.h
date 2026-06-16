@@ -5,6 +5,7 @@
 enum screen_t {
     SCREEN_SPLASH,
     SCREEN_USAGE,
+    SCREEN_SESSIONS,   // NEW — session list with row-tap focus
     SCREEN_COUNT,
 };
 
@@ -16,3 +17,6 @@ void ui_toggle_splash(void);
 screen_t ui_get_current_screen(void);
 void ui_update_ble_status(ble_state_t state, const char* name, const char* mac);
 void ui_update_battery(int percent, bool charging);
+void ui_update_sessions(const UsageData* data);
+void ui_notify_focus_by_idx(const UsageData* data, int8_t idx);  // idx=-1 clears
+bool ui_has_focused_session(void);

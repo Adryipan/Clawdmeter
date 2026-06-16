@@ -21,6 +21,10 @@ import httpx
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 
+from session_scan import scan_sessions
+from payload import build_payload
+from focus_listener import start_focus_listener, stop_focus_listener
+
 DEVICE_NAME = "Clawdmeter"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
@@ -29,6 +33,7 @@ REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 POLL_INTERVAL = 60
 TICK = 5
 SCAN_TIMEOUT = 8.0
+SCAN_INTERVAL = 10
 
 # macOS: token lives in Keychain (service "Claude Code-credentials").
 # Linux: token lives in ~/.claude/.credentials.json.
@@ -318,6 +323,9 @@ class Session:
     def __init__(self, client: BleakClient) -> None:
         self.client = client
         self.refresh_requested = asyncio.Event()
+        self.last_scan_time: float = 0.0
+        self.last_payload_bytes: bytes = b""
+        self.last_api_data: dict | None = None  # cache latest API data for scan-triggered sends
 
     def _on_refresh(self, _char, _data: bytearray) -> None:
         log("Refresh requested by device")
@@ -329,15 +337,62 @@ class Session:
         except (BleakError, ValueError) as e:
             log(f"Refresh subscription unavailable: {e}")
 
-    async def write_payload(self, payload: dict) -> bool:
-        data = json.dumps(payload, separators=(",", ":")).encode()
+    async def write_payload(self, data: bytes) -> bool:
         log(f"Sending: {data.decode()}")
         try:
-            await self.client.write_gatt_char(RX_CHAR_UUID, data, response=False)
+            await self.client.write_gatt_char(RX_CHAR_UUID, data, response=True)
             return True
         except BleakError as e:
             log(f"Write failed: {e}")
             return False
+
+
+async def maybe_scan_and_send(
+    session: "Session",
+    sessions: list,
+    focused_ref: list,
+    pid_map: dict,
+    now: float,
+) -> list:
+    """Run a session scan if SCAN_INTERVAL has elapsed; send if payload changed.
+
+    Returns the (possibly updated) sessions list.  Mutates session.last_scan_time,
+    session.last_payload_bytes, focused_ref[0], and pid_map in place.
+    """
+    if now - session.last_scan_time < SCAN_INTERVAL:
+        return sessions
+
+    session.last_scan_time = now
+    focused_id = focused_ref[0]
+    loop = asyncio.get_running_loop()
+    try:
+        sessions = await loop.run_in_executor(None, scan_sessions, focused_id)
+    except Exception as e:
+        log(f"scan_sessions error: {e}")
+        return sessions  # keep previous list
+
+    # Update pid_map for Task 5 focus_listener resolver
+    pid_map.clear()
+    for s in sessions:
+        if s.pid:
+            pid_map[s.id] = s.pid
+
+    # Clear focus if focused session no longer present or is dead
+    if focused_ref[0]:
+        live = next(
+            (s for s in sessions if s.id == focused_ref[0] and s.mood != "d"),
+            None,
+        )
+        if not live:
+            focused_ref[0] = None
+
+    if session.last_api_data is not None:
+        merged = build_payload(session.last_api_data, sessions, focused_ref[0])
+        if merged != session.last_payload_bytes:
+            if await session.write_payload(merged):
+                session.last_payload_bytes = merged
+
+    return sessions
 
 
 async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
@@ -365,6 +420,16 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
     session = Session(client)
     await session.setup_refresh_subscription()
 
+    focused_ref = [None]   # mutable cell — Task 5 focus_listener consumer writes here
+    pid_map = {}           # {sid: pid} — updated by scan loop every 10 s
+    sessions: list = []    # latest scan result — shared between scan and API-poll blocks
+
+    focus_task = None
+    try:
+        focus_task = await start_focus_listener(client, pid_map, focused_ref)
+    except BleakError as e:
+        log(f"FOCUS_CHAR not available (old firmware): {e}")
+
     last_poll = 0.0
     used_successfully = False
     try:
@@ -379,15 +444,24 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
                 else:
                     payload = await poll_api(token)
                     if payload is not None:
-                        if await session.write_payload(payload):
-                            last_poll = time.time()
-                            used_successfully = True
+                        session.last_api_data = payload  # cache for scan-triggered sends
+                        merged = build_payload(session.last_api_data, sessions, focused_ref[0])
+                        if merged != session.last_payload_bytes:
+                            if await session.write_payload(merged):
+                                session.last_payload_bytes = merged
+                                last_poll = time.time()
+                                used_successfully = True
+
+            # Session scan — independent 10 s cadence
+            sessions = await maybe_scan_and_send(session, sessions, focused_ref, pid_map, now)
 
             try:
                 await asyncio.wait_for(session.refresh_requested.wait(), timeout=TICK)
             except asyncio.TimeoutError:
                 pass
     finally:
+        if focus_task is not None:
+            await stop_focus_listener(client, focus_task)
         try:
             await client.disconnect()
         except BleakError:

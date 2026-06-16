@@ -34,3 +34,14 @@ lv_obj_t* splash_get_root(void);
 // splash_mini_tick(). One mini creature at a time.
 lv_obj_t* splash_mini_create(lv_obj_t *parent, const char *anim_name, int px);
 void splash_mini_tick(void);
+
+// Switch to the named animation immediately; resets frame state and renders frame 0.
+// No-op if name not found (logs a warning). Name must match splash_anims[].name exactly.
+// Efficiency guard: if the requested animation is already current, returns immediately
+// without restarting frame state (prevents stutter on every payload refresh).
+// Also sets mood_hold=true so the rate-group ticker does not override the selection.
+void splash_set_animation_by_name(const char* name);
+
+// Release the mood hold so the rate-group rotation ticker resumes.
+// Call when there are zero active sessions (splash reverts to "as today" behaviour).
+void splash_release_mood_hold(void);

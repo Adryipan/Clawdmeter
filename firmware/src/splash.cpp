@@ -30,6 +30,10 @@ static uint16_t cur_frame = 0;
 static uint32_t frame_started_ms = 0;
 static uint32_t last_pick_ms = 0;
 static bool active = false;
+// When true, the mood engine owns the animation selection; the rate-group
+// rotation ticker in splash_tick is suppressed until explicitly released.
+// Manual PWR-button cycling (splash_next) is UNGATED — user intent wins.
+static bool mood_hold = false;
 
 // While splash is showing, auto-cycle to the next animation in the current
 // rate-driven group every this many ms.
@@ -161,7 +165,7 @@ static void show_placeholder() {
 void splash_init(lv_obj_t *parent) {
     const BoardCaps& c = board_caps();
     int min_dim = (c.width < c.height) ? c.width : c.height;
-    cell     = min_dim / GRID;       // fits within the smaller display dimension
+    cell     = min_dim / (GRID * 2);  // half-frame: creature spans ~half the display
     if (cell < 4) cell = 4;
 
 #ifdef BOARD_HAS_PSRAM
@@ -229,7 +233,8 @@ void splash_tick(void) {
     if (!active || SPLASH_ANIM_COUNT == 0) return;
 
     // Auto-rotate to the next animation in the current group.
-    if (millis() - last_pick_ms >= SPLASH_ROTATE_INTERVAL_MS) {
+    // Suppressed while mood_hold is active (mood engine owns selection).
+    if (!mood_hold && millis() - last_pick_ms >= SPLASH_ROTATE_INTERVAL_MS) {
         splash_pick_for_current_rate();
     }
 
@@ -253,6 +258,28 @@ void splash_next(void) {
     const splash_anim_def_t *a = &splash_anims[cur_anim];
     render_frame(a->frames[0], a->palette);
     Serial.printf("splash: -> %s\n", a->name);
+}
+
+void splash_set_animation_by_name(const char* name) {
+    if (SPLASH_ANIM_COUNT == 0) return;
+    // Mood engine owns selection — hold must persist across repeated payloads.
+    mood_hold = true;
+    // Efficiency guard: already playing this animation — don't restart frame state.
+    if (strcmp(splash_anims[cur_anim].name, name) == 0) return;
+    for (int i = 0; i < SPLASH_ANIM_COUNT; i++) {
+        if (strcmp(splash_anims[i].name, name) == 0) {
+            cur_anim = (uint16_t)i;
+            cur_frame = 0;
+            frame_started_ms = millis();
+            render_frame(splash_anims[i].frames[0], splash_anims[i].palette);
+            return;
+        }
+    }
+    Serial.printf("splash_set_animation_by_name: '%s' not found\n", name);
+}
+
+void splash_release_mood_hold(void) {
+    mood_hold = false;
 }
 
 void splash_pick_for_current_rate(void) {
