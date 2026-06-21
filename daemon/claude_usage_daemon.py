@@ -32,6 +32,8 @@ REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 
 POLL_INTERVAL = 60
 TICK = 5
+WATCHDOG_TIMEOUT = 180  # seconds (3x POLL_INTERVAL); wall-clock — survives macOS sleep
+# ponytail: WATCHDOG_TIMEOUT is the tunable knob for post-sleep BLE freeze recovery
 SCAN_TIMEOUT = 8.0
 SCAN_INTERVAL = 10
 
@@ -326,6 +328,7 @@ class Session:
         self.last_scan_time: float = 0.0
         self.last_payload_bytes: bytes = b""
         self.last_api_data: dict | None = None  # cache latest API data for scan-triggered sends
+        self.last_send_time: float = time.time()
 
     def _on_refresh(self, _char, _data: bytearray) -> None:
         log("Refresh requested by device")
@@ -341,6 +344,7 @@ class Session:
         log(f"Sending: {data.decode()}")
         try:
             await self.client.write_gatt_char(RX_CHAR_UUID, data, response=True)
+            self.last_send_time = time.time()
             return True
         except BleakError as e:
             log(f"Write failed: {e}")
@@ -395,6 +399,26 @@ async def maybe_scan_and_send(
     return sessions
 
 
+async def send_watchdog(client, session, stop_event):
+    """Watchdog: force reconnect if no successful send in WATCHDOG_TIMEOUT seconds.
+    Uses wall-clock time (time.time()) so it fires correctly after macOS sleeps.
+    # ponytail: WATCHDOG_TIMEOUT is the tunable knob
+    """
+    while True:
+        await asyncio.sleep(TICK)
+        if stop_event.is_set():
+            break
+        if client.is_connected and (time.time() - session.last_send_time) > WATCHDOG_TIMEOUT:
+            elapsed = int(time.time() - session.last_send_time)
+            log(f"Watchdog: no successful send in {elapsed}s — forcing reconnect")
+            try:
+                # ponytail: relies on Bleak raising on the in-flight write_gatt_char when the link tears down, which unblocks the poll loop. If disconnect() itself times out, we degrade to the manual 'launchctl kickstart -k ...com.user.claude-usage-daemon' recovery.
+                await asyncio.wait_for(client.disconnect(), timeout=10)
+            except Exception as e:
+                log(f"Watchdog: disconnect error (ignored): {e}")
+            return  # Exit; main() re-scan loop will reconnect
+
+
 async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
     """Connect to a target and poll until disconnected or stopped.
 
@@ -418,6 +442,7 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
 
     log("Connected")
     session = Session(client)
+    session.last_send_time = time.time()  # Reset on fresh connect; don't trip watchdog immediately
     await session.setup_refresh_subscription()
 
     focused_ref = [None]   # mutable cell — Task 5 focus_listener consumer writes here
@@ -429,6 +454,8 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
         focus_task = await start_focus_listener(client, pid_map, focused_ref)
     except BleakError as e:
         log(f"FOCUS_CHAR not available (old firmware): {e}")
+
+    watchdog_task = asyncio.create_task(send_watchdog(client, session, stop_event))
 
     last_poll = 0.0
     used_successfully = False
@@ -460,6 +487,11 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
             except asyncio.TimeoutError:
                 pass
     finally:
+        watchdog_task.cancel()
+        try:
+            await watchdog_task
+        except (asyncio.CancelledError, Exception):
+            pass
         if focus_task is not None:
             await stop_focus_listener(client, focus_task)
         try:
